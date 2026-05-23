@@ -623,10 +623,29 @@ const Projectile = function(x, y, config) {
   this.type = config.type||'bullet';
   this.hitEnemies = new Set();
   this.trail = [];
+  // 追踪
+  this.homing = config.homing||0;
+  // 分裂（命中时触发）
+  this.onHitSplit = config.onHitSplit||null; // { count, damage, speed, color, w, h }
 };
 Projectile.prototype = Object.create(Entity.prototype);
 Projectile.prototype.constructor = Projectile;
 Projectile.prototype.update = function(dt) {
+  // 追踪逻辑：转向最近的敌人
+  if (this.homing > 0 && this._target && !this._target.dead) {
+    var tdx = this._target.x - this.x;
+    var tdy = this._target.y - this.y;
+    var targetAngle = Math.atan2(tdy, tdx);
+    var currentAngle = Math.atan2(this.dy, this.dx);
+    var diff = targetAngle - currentAngle;
+    // 规范化角度差到 [-PI, PI]
+    while (diff > Math.PI) diff -= Math.PI*2;
+    while (diff < -Math.PI) diff += Math.PI*2;
+    var turn = Math.min(Math.abs(diff), this.homing * dt);
+    var newAngle = currentAngle + Math.sign(diff) * turn;
+    this.dx = Math.cos(newAngle);
+    this.dy = Math.sin(newAngle);
+  }
   this.x += this.dx * this.speed * dt;
   this.y += this.dy * this.speed * dt;
   this.lifetime -= dt;
@@ -1021,10 +1040,51 @@ Spawner.onEnemyDeath = function(enemy, em) {
 // ============ WeaponSystem ============
 const WEAPONS = [
   {
-    id:'wand', name:'魔法杖', icon:'🪄', desc:'发射追踪魔法弹', maxLv:5,
-    getCooldown: function(lv) { return [1.2,1.0,0.8,0.6,0.5][lv-1]; },
-    getDamage: function(lv) { return [8,10,14,18,24][lv-1]; },
-    getCount: function(lv) { return [1,1,1,2,2][lv-1]; },
+    id:'wand', name:'魔法杖', icon:'🪄', desc:'发射追踪魔法弹', maxLv:7,
+    // 共同线数值
+    getCooldown: function(lv) { return [1.2,1.0,0.8,0.65,0.5,0.4,0.3][lv-1]; },
+    getDamage: function(lv) { return [8,12,14,18,22,26,32][lv-1]; },
+    // 弹数：力量分支 Lv.3 不变（靠碎片清群），智慧分支 Lv.3 开始变2发
+    getCount: function(lv, branch) {
+      if (branch === 'wisdom') return [1,1,2,2,2,3,3][lv-1];
+      return [1,1,1,1,2,2,2][lv-1];
+    },
+    // 穿透：力量分支 Lv.4+ 有穿透（配合分裂），智慧分支 Lv.6 有穿透
+    getPiercing: function(lv, branch) {
+      if (branch === 'power') {
+        if (lv >= 6) return 3;
+        if (lv >= 4) return 2;
+      }
+      if (branch === 'wisdom' && lv >= 6) return 2;
+      return 1;
+    },
+    // 分裂碎片（力量专属）
+    getSplitCount: function(lv, branch) {
+      if (branch !== 'power') return 0;
+      if (lv >= 6) return 5;
+      if (lv >= 5) return 4;
+      if (lv >= 4) return 3;
+      if (lv >= 3) return 2;
+      return 0;
+    },
+    getSplitDamageRatio: function(lv) {
+      // 碎片伤害比例随等级提高
+      if (lv >= 6) return 0.5;
+      if (lv >= 4) return 0.4;
+      return 0.3;
+    },
+    // 追踪（智慧专属）
+    getHoming: function(lv, branch) {
+      if (branch !== 'wisdom') return 0;
+      if (lv >= 5) return 5.0;
+      if (lv >= 3) return 3.5;
+      return 0;
+    },
+    getBranchName: function(branch) {
+      if (branch === 'power') return '力量';
+      if (branch === 'wisdom') return '智慧';
+      return '';
+    },
   },
   {
     id:'axe', name:'飞斧', icon:'🪓', desc:'向四周投掷回旋斧', maxLv:5,
@@ -1054,6 +1114,7 @@ const WeaponSystem = function(player) {
   this._shieldZone = null;
   this._fireZone = null;
   this._axePhase = 0;
+  this.wandBranch = null; // 'power' | 'wisdom' | null
 };
 WeaponSystem.prototype.addWeapon = function(weaponId) {
   var w = WEAPONS.find(function(w2){ return w2.id===weaponId; });
@@ -1090,14 +1151,30 @@ WeaponSystem.prototype._fireWand = function(w, level, player, enemies, em) {
   });
   if (!closest) return;
   var angle = Math.atan2(closest.y-player.y, closest.x-player.x);
-  var count = w.getCount(level);
+  var count = w.getCount(level, this.wandBranch);
+  var piercing = w.getPiercing(level, this.wandBranch);
+  var homing = w.getHoming(level, this.wandBranch);
+  var splitCount = w.getSplitCount(level, this.wandBranch);
+  var baseDamage = Math.floor(w.getDamage(level)*(player.damageMultiplier||1));
   for (var i=0; i<count; i++) {
-    var offset = (i - (count-1)/2)*0.3;
-    em.add(new Projectile(player.x, player.y, {
+    var offset = (i - (count-1)/2)*0.25;
+    var proj = new Projectile(player.x, player.y, {
       dx:Math.cos(angle+offset), dy:Math.sin(angle+offset),
-      damage:Math.floor(w.getDamage(level)*(player.damageMultiplier||1)),
-      speed:260, lifetime:2, color:'#b388ff', type:'magic', w:12, h:12, piercing:1,
-    }));
+      damage: baseDamage,
+      speed:260, lifetime:2, color:'#b388ff', type:'magic', w:12, h:12,
+      piercing: piercing,
+      homing: homing,
+      onHitSplit: splitCount > 0 ? {
+        count: splitCount,
+        damage: Math.max(1, Math.floor(baseDamage * w.getSplitDamageRatio(level))),
+        speed: 180,
+        color: '#d1a3ff',
+        w: 8, h: 8,
+      } : null,
+    });
+    // 追踪弹设置初始目标
+    if (homing > 0) proj._target = closest;
+    em.add(proj);
   }
 };
 WeaponSystem.prototype._fireAxe = function(w, level, player, em) {
@@ -1147,7 +1224,18 @@ WeaponSystem.prototype.getUpgradeOptions = function(count) {
   var self = this;
   this.slots.forEach(function(slot){
     if (slot.level < slot.weapon.maxLv) {
-      options.push({type:'upgrade', weaponId:slot.weapon.id, name:slot.weapon.name, icon:slot.weapon.icon, desc:'Lv.'+slot.level+' → Lv.'+(slot.level+1), level:slot.level+1});
+      // 魔法杖 Lv.2→3 分支选择
+      if (slot.weapon.id === 'wand' && slot.level === 2 && !self.wandBranch) {
+        options.push({type:'wand_branch', weaponId:'wand', branch:'power',
+          name:'魔法杖 - 力量', icon:'🪄', desc:'裂空弹：命中分裂碎片', level:3});
+        options.push({type:'wand_branch', weaponId:'wand', branch:'wisdom',
+          name:'魔法杖 - 智慧', icon:'🪄', desc:'智能追踪：自动转向敌人', level:3});
+      } else {
+        var branchName = (slot.weapon.id === 'wand' && self.wandBranch) ? ' - ' + slot.weapon.getBranchName(self.wandBranch) : '';
+        options.push({type:'upgrade', weaponId:slot.weapon.id,
+          name:slot.weapon.name + branchName, icon:slot.weapon.icon,
+          desc:'Lv.'+slot.level+' → Lv.'+(slot.level+1), level:slot.level+1});
+      }
     }
   });
   var owned = this.slots.map(function(s){ return s.weapon.id; });
@@ -1164,6 +1252,10 @@ WeaponSystem.prototype.getUpgradeOptions = function(count) {
   return options.slice(0, count);
 };
 WeaponSystem.prototype.applyUpgrade = function(option) {
+  if (option.type==='wand_branch') {
+    this.wandBranch = option.branch;
+    return this.addWeapon(option.weaponId);
+  }
   if (option.type==='upgrade'||option.type==='new') return this.addWeapon(option.weaponId);
   if (option.type==='passive') {
     switch(option.stat){
@@ -1254,6 +1346,23 @@ function update(dt) {
     if (!enemy.dead) enemy.update(dt, player.x, player.y, enemies, em);
   });
 
+  // 追踪弹目标刷新：每0.3秒重新锁定最近敌人
+  em.entities.forEach(function(e){
+    if (e instanceof Projectile && e.homing > 0 && !e.dead) {
+      if (!e._target || e._target.dead || !e._homingTimer || e._homingTimer <= 0) {
+        var closest = null, minDist = Infinity;
+        enemies.forEach(function(en){
+          if (en.dead) return;
+          var d = Math.hypot(en.x-e.x, en.y-e.y);
+          if (d < minDist) { minDist = d; closest = en; }
+        });
+        if (closest) e._target = closest;
+        e._homingTimer = 0.3;
+      }
+      e._homingTimer -= dt;
+    }
+  });
+
   // 弓骷髅：射箭逻辑
   enemies.forEach(function(enemy){
     if (enemy.dead || enemy.typeName !== 'archer') return;
@@ -1305,6 +1414,18 @@ function update(dt) {
         if (proj.hitEnemy(enemy)) {
           var died = enemy.takeDamage(Math.floor(proj.damage * (player.damageMultiplier||1)), proj.x, proj.y);
           if (died) { Spawner.onEnemyDeath(enemy, em); player.kills++; }
+          // 分裂碎片（裂空弹）
+          if (proj.onHitSplit) {
+            var sc = proj.onHitSplit;
+            for (var si=0; si<sc.count; si++) {
+              var sa = (Math.PI*2/sc.count)*si + Math.random()*0.5;
+              em.add(new Projectile(proj.x, proj.y, {
+                dx:Math.cos(sa), dy:Math.sin(sa),
+                damage:sc.damage, speed:sc.speed, lifetime:1.0,
+                color:sc.color, type:'magic', w:sc.w, h:sc.h, piercing:1,
+              }));
+            }
+          }
         }
       }
     });
