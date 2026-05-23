@@ -303,6 +303,7 @@ const Player = function(x, y) {
   this.kills = 0;
   this.invincibleTimer = 0; this.flashTimer = 0;
   this.damageMultiplier = 1;
+  this.slowTimer = 0;
 };
 Player.prototype = Object.create(Entity.prototype);
 Player.prototype.constructor = Player;
@@ -328,16 +329,28 @@ Player.prototype.addXp = function(amount) {
 Player.prototype.update = function(dt, moveDir) {
   // 防御性检查
   if (!moveDir) moveDir = {dx:0, dy:0};
-  this.x += moveDir.dx * this.speed * dt;
-  this.y += moveDir.dy * this.speed * dt;
+  // 减速效果
+  if (this.slowTimer > 0) this.slowTimer -= dt;
+  var speedMul = this.slowTimer > 0 ? 0.5 : 1.0;
+  this.x += moveDir.dx * this.speed * speedMul * dt;
+  this.y += moveDir.dy * this.speed * speedMul * dt;
   var clamped = clampPosition(this.x, this.y, this.w/2, this.h/2);
   this.x = clamped.x; this.y = clamped.y;
   if (this.invincibleTimer > 0) this.invincibleTimer -= dt;
   if (this.flashTimer > 0) this.flashTimer -= dt;
+  // 生命回复
+  if (this.hpRegen && this.hpRegen > 0 && this.hp < this.maxHp) {
+    this.hp = Math.min(this.maxHp, this.hp + this.hpRegen * dt);
+  }
 };
 Player.prototype.render = function(ctx, cam) {
   var sx = this.x - cam.x, sy = this.y - cam.y;
   if (this.flashTimer > 0 && Math.floor(this.flashTimer * 20) % 2 === 0) return;
+  // 减速视觉反馈
+  if (this.slowTimer > 0) {
+    ctx.fillStyle = 'rgba(45,106,79,0.3)';
+    ctx.beginPath(); ctx.arc(sx, sy, 18, 0, Math.PI*2); ctx.fill();
+  }
   // 身体
   ctx.fillStyle = '#3a86ff';
   ctx.beginPath(); ctx.arc(sx, sy, 14, 0, Math.PI*2); ctx.fill();
@@ -357,11 +370,10 @@ Player.prototype.render = function(ctx, cam) {
 
 // ============ Enemy ============
 const ENEMY_TYPES = {
-  bat:     {name:'蝙蝠',   hp:8,   speed:100, damage:5,  w:18, h:18, xp:1,  color:'#8338ec', attackCooldown:1.0, mass:0.5},
-  zombie:  {name:'僵尸',   hp:25,  speed:45,  damage:10, w:24, h:24, xp:3,  color:'#2d6a4f', attackCooldown:1.2, mass:1.0},
-  skeleton:{name:'骷髅',   hp:40,  speed:65,  damage:12, w:22, h:22, xp:5,  color:'#e9ecef', attackCooldown:0.8, mass:0.8},
-  ghost:   {name:'幽灵',   hp:30,  speed:110, damage:8,  w:20, h:20, xp:6,  color:'#adb5bd', attackCooldown:0.6, mass:0.3},
-  demon:   {name:'恶魔',   hp:100, speed:50,  damage:20, w:30, h:30, xp:15, color:'#d00000', attackCooldown:1.5, mass:1.5},
+  bat:     {name:'蝙蝠',   hp:5,   speed:100, damage:5,  w:18, h:18, xp:1,  color:'#8338ec', attackCooldown:1.0, mass:0.5},
+  zombie:  {name:'僵尸',   hp:25,  speed:45,  damage:10, w:24, h:24, xp:3,  color:'#2d6a4f', attackCooldown:1.2, mass:1.0, slowOnHit:0.6},
+  ghost:   {name:'幽灵',   hp:30,  speed:110, damage:8,  w:20, h:20, xp:6,  color:'#adb5bd', attackCooldown:0.6, mass:0.3, phaseAbility:true},
+  demon:   {name:'恶魔',   hp:100, speed:50,  damage:20, w:30, h:30, xp:15, color:'#d00000', attackCooldown:1.5, mass:1.5, chargeAbility:true},
   boss:    {name:'BOSS',   hp:500, speed:35,  damage:30, w:48, h:48, xp:50, color:'#ff006e', attackCooldown:2.0, mass:3.0},
   // 新增特殊敌人
   slime:      {name:'史莱姆', hp:50,  speed:40,  damage:8,  w:28, h:28, xp:6,  color:'#22c55e', attackCooldown:1.0, mass:2.5}, // 分裂型
@@ -397,6 +409,22 @@ const Enemy = function(x, y, typeName, diffScale) {
     this.blinkTimer = 0;      // 闪烁计时（靠近时触发）
     this.blinking = false;    // 是否已进入预警
     this.blinkSpeed = 8;      // 闪烁频率
+  }
+  // 幽灵：闪烁隐身能力
+  if (typeName === 'ghost') {
+    this.phaseTimer = 0;
+    this.phaseCycle = 3.0; // 3秒一轮（1.5秒可见+1.5秒半隐）
+    this.phaseAlpha = 1.0;
+  }
+  // 恶魔：冲锋能力
+  if (typeName === 'demon') {
+    this.chargeTimer = 3 + Math.random() * 2; // 首次冲锋延迟
+    this.charging = false;
+    this.chargeSpeed = 220;
+    this.chargeDuration = 0.6;
+    this.chargeTime = 0;
+    this.chargeAngle = 0;
+    this.chargeCooldown = 5; // 冲锋冷却5秒
   }
 };
 Enemy.prototype = Object.create(Entity.prototype);
@@ -465,6 +493,61 @@ Enemy.prototype.onAttack = function() {
 };
 Enemy.prototype.update = function(dt, px, py, enemies, em) {
   if (this.dead) return;
+
+  // ---- 幽灵 AI：周期性隐身，隐身时半伤 ----
+  if (this.typeName === 'ghost') {
+    this.phaseTimer += dt;
+    // 周期循环：0-1.5s可见(alpha=1), 1.5-2.25s渐隐, 2.25-3.0s渐现
+    var phase = this.phaseTimer % this.phaseCycle;
+    if (phase < 1.5) {
+      this.phaseAlpha = 1.0;
+    } else if (phase < 2.0) {
+      this.phaseAlpha = 1.0 - (phase - 1.5) / 0.5; // 渐隐到0.2
+    } else if (phase < 2.75) {
+      this.phaseAlpha = 0.2; // 完全隐身
+    } else {
+      this.phaseAlpha = 0.2 + (phase - 2.75) / 0.25; // 渐现到1.0
+    }
+    this.moveToward(px, py, dt, enemies, this.speed);
+    if (this.attackTimer > 0) this.attackTimer -= dt;
+    if (this.hitFlashTimer > 0) this.hitFlashTimer -= dt;
+    return;
+  }
+
+  // ---- 恶魔 AI：普通追踪 + 冲锋技能 ----
+  if (this.typeName === 'demon') {
+    if (this.charging) {
+      this.chargeTime += dt;
+      // 沿冲锋方向高速移动
+      this.x += Math.cos(this.chargeAngle) * this.chargeSpeed * dt;
+      this.y += Math.sin(this.chargeAngle) * this.chargeSpeed * dt;
+      var clamped = clampPosition(this.x, this.y, this.w/2, this.h/2);
+      this.x = clamped.x; this.y = clamped.y;
+      if (this.chargeTime >= this.chargeDuration) {
+        this.charging = false;
+        this.chargeTimer = this.chargeCooldown;
+      }
+      this.animPhase += dt * 10;
+    } else {
+      this.chargeTimer -= dt;
+      if (this.chargeTimer <= 0) {
+        // 开始冲锋：锁定当前玩家方向
+        var dx = px - this.x, dy = py - this.y;
+        var dist = Math.sqrt(dx*dx + dy*dy);
+        if (dist > 60) {
+          this.chargeAngle = Math.atan2(dy, dx);
+          this.charging = true;
+          this.chargeTime = 0;
+        } else {
+          this.chargeTimer = 1; // 太近就不冲
+        }
+      }
+      this.moveToward(px, py, dt, enemies, this.speed);
+    }
+    if (this.attackTimer > 0) this.attackTimer -= dt;
+    if (this.hitFlashTimer > 0) this.hitFlashTimer -= dt;
+    return;
+  }
 
   // ---- 弓骷髅 AI：保持距离，远程射箭 ----
   if (this.typeName === 'archer') {
@@ -636,6 +719,73 @@ Enemy.prototype.render = function(ctx, cam) {
       var barW = this.w+4, barH = 3;
       ctx.fillStyle = '#333'; ctx.fillRect(sx-barW/2, sy-r-8, barW, barH);
       ctx.fillStyle = '#ff4d4d'; ctx.fillRect(sx-barW/2, sy-r-8, barW*(this.hp/this.maxHp), barH);
+    }
+    return;
+  }
+
+  // ---- 恶魔：冲锋时有拖影 ----
+  if (this.typeName === 'demon') {
+    var dFlash = this.hitFlashTimer > 0;
+    // 冲锋拖影
+    if (this.charging) {
+      ctx.globalAlpha = 0.3;
+      ctx.fillStyle = dFlash ? '#fff' : '#ff4444';
+      ctx.beginPath(); ctx.arc(sx - Math.cos(this.chargeAngle)*16, sy - Math.sin(this.chargeAngle)*16, r*0.8, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 0.15;
+      ctx.beginPath(); ctx.arc(sx - Math.cos(this.chargeAngle)*32, sy - Math.sin(this.chargeAngle)*32, r*0.6, 0, Math.PI*2); ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    ctx.fillStyle = dFlash ? '#fff' : this.color;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.fill();
+    // 角
+    ctx.fillStyle = dFlash ? '#fff' : '#8b0000';
+    ctx.beginPath(); ctx.moveTo(sx-r*0.6, sy-r*0.4); ctx.lineTo(sx-r*0.3, sy-r*1.1); ctx.lineTo(sx-r*0.0, sy-r*0.4); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(sx+r*0.0, sy-r*0.4); ctx.lineTo(sx+r*0.3, sy-r*1.1); ctx.lineTo(sx+r*0.6, sy-r*0.4); ctx.fill();
+    // 眼睛
+    ctx.fillStyle = dFlash ? '#e63946' : '#ff0';
+    ctx.beginPath(); ctx.arc(sx-r*0.3, sy-r*0.1, r*0.2, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+r*0.3, sy-r*0.1, r*0.2, 0, Math.PI*2); ctx.fill();
+    // 冲锋冷却指示（小CD条）
+    if (!this.charging && this.chargeTimer > 0) {
+      var cdRatio = Math.max(0, 1 - this.chargeTimer / this.chargeCooldown);
+      ctx.fillStyle = '#333'; ctx.fillRect(sx-r, sy-r-10, r*2, 3);
+      ctx.fillStyle = '#ff6b6b'; ctx.fillRect(sx-r, sy-r-10, r*2*cdRatio, 3);
+    }
+    if (this.hp > 0 && this.hp < this.maxHp) {
+      var barW = this.w+4, barH = 3;
+      ctx.fillStyle = '#333'; ctx.fillRect(sx-barW/2, sy-r-14, barW, barH);
+      ctx.fillStyle = '#d00000'; ctx.fillRect(sx-barW/2, sy-r-14, barW*(this.hp/this.maxHp), barH);
+    }
+    return;
+  }
+
+  // ---- 幽灵：隐身闪烁 ----
+  if (this.typeName === 'ghost') {
+    ctx.globalAlpha = this.phaseAlpha;
+    ctx.fillStyle = this.hitFlashTimer > 0 ? '#fff' : this.color;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.fill();
+    // 内部波纹
+    ctx.fillStyle = 'rgba(255,255,255,' + (0.2 * this.phaseAlpha) + ')';
+    ctx.beginPath(); ctx.arc(sx, sy, r*0.5, 0, Math.PI*2); ctx.fill();
+    // 眼睛
+    ctx.fillStyle = 'rgba(0,0,0,' + this.phaseAlpha + ')';
+    ctx.beginPath(); ctx.arc(sx-r*0.25, sy-r*0.1, r*0.15, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.arc(sx+r*0.25, sy-r*0.1, r*0.15, 0, Math.PI*2); ctx.fill();
+    ctx.globalAlpha = 1;
+    // 隐身提示（虚线圈）
+    if (this.phaseAlpha < 0.5) {
+      ctx.strokeStyle = 'rgba(173,181,189,0.3)';
+      ctx.lineWidth = 1;
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath(); ctx.arc(sx, sy, r+4, 0, Math.PI*2); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    if (this.hp > 0 && this.hp < this.maxHp) {
+      ctx.globalAlpha = Math.max(this.phaseAlpha, 0.4);
+      var barW = this.w+4, barH = 3;
+      ctx.fillStyle = '#333'; ctx.fillRect(sx-barW/2, sy-r-8, barW, barH);
+      ctx.fillStyle = '#adb5bd'; ctx.fillRect(sx-barW/2, sy-r-8, barW*(this.hp/this.maxHp), barH);
+      ctx.globalAlpha = 1;
     }
     return;
   }
@@ -887,11 +1037,11 @@ HealthPotion.prototype.render = function(ctx, cam) {
 
 // 掉落概率（参考 Vampire Survivors 的 Floor Chicken 机制）
 // 普通敌人：小血瓶 15%，大血瓶 3%
-// 精英/幽灵/骷髅：小血瓶 30%，大血瓶 10%
+// 精英/幽灵/弓骷髅：小血瓶 30%，大血瓶 10%
 // BOSS：小血瓶 100%，大血瓶 50%，Floor Chicken（回复50%HP）25%
 function rollHealthDrop(enemyTypeName) {
   var isBoss = enemyTypeName === 'boss';
-  var isElite = (enemyTypeName === 'demon' || enemyTypeName === 'ghost' || enemyTypeName === 'skeleton' || enemyTypeName === 'archer');
+  var isElite = (enemyTypeName === 'demon' || enemyTypeName === 'ghost' || enemyTypeName === 'archer');
   // bomber 死亡后已经很危险，给稍高的血瓶概率作为补偿
   var isBomber = enemyTypeName === 'bomber';
   if (isBoss) {
@@ -964,12 +1114,12 @@ DamageZone.prototype.render = function(ctx, cam) {
 const WAVES = [
   { duration: 20, pool:[{type:'bat',w:1}],                                              interval:1.2, maxEnemies:15, diff:1.0 },
   { duration: 25, pool:[{type:'bat',w:2},{type:'zombie',w:1}],                          interval:1.0, maxEnemies:20, diff:1.2 },
-  { duration: 25, pool:[{type:'bat',w:1},{type:'zombie',w:2},{type:'slime',w:1}],       interval:0.9, maxEnemies:22, diff:1.4 }, // 史莱姆登场
-  { duration: 30, pool:[{type:'zombie',w:2},{type:'skeleton',w:1},{type:'archer',w:1}], interval:0.8, maxEnemies:25, diff:1.6 }, // 弓骷髅登场
-  { duration: 30, pool:[{type:'zombie',w:1},{type:'skeleton',w:2},{type:'bomber',w:1}], interval:0.7, maxEnemies:28, diff:1.8 }, // 爆炸幽灵登场
-  { duration: 30, pool:[{type:'skeleton',w:2},{type:'ghost',w:2},{type:'slime',w:1},{type:'archer',w:1}], interval:0.6, maxEnemies:32, diff:2.0 },
+  { duration: 25, pool:[{type:'bat',w:1},{type:'zombie',w:2},{type:'slime',w:1}],       interval:0.9, maxEnemies:22, diff:1.4 },
+  { duration: 30, pool:[{type:'zombie',w:2},{type:'archer',w:1},{type:'slime',w:1}],    interval:0.8, maxEnemies:25, diff:1.6 },
+  { duration: 30, pool:[{type:'zombie',w:1},{type:'archer',w:1},{type:'bomber',w:1}],   interval:0.7, maxEnemies:28, diff:1.8 },
+  { duration: 30, pool:[{type:'ghost',w:2},{type:'slime',w:1},{type:'archer',w:1}],     interval:0.6, maxEnemies:32, diff:2.0 },
   { duration: 35, pool:[{type:'ghost',w:2},{type:'demon',w:1},{type:'bomber',w:1}],     interval:0.5, maxEnemies:35, diff:2.3 },
-  { duration: 35, pool:[{type:'skeleton',w:1},{type:'ghost',w:2},{type:'demon',w:2},{type:'archer',w:1},{type:'bomber',w:1}], interval:0.45, maxEnemies:40, diff:2.6 },
+  { duration: 35, pool:[{type:'ghost',w:2},{type:'demon',w:2},{type:'archer',w:1},{type:'bomber',w:1}], interval:0.45, maxEnemies:40, diff:2.6 },
   { duration: 40, pool:[{type:'demon',w:2},{type:'slime',w:2},{type:'bomber',w:1}],     interval:0.4, maxEnemies:45, diff:3.0 },
   { duration: 60, pool:[{type:'demon',w:2},{type:'ghost',w:2},{type:'archer',w:1},{type:'bomber',w:2}], interval:0.35, maxEnemies:50, diff:3.5 },
 ];
@@ -1084,8 +1234,8 @@ const WEAPONS = [
   {
     id:'wand', name:'魔法杖', icon:'🪄', desc:'发射追踪魔法弹', maxLv:7,
     // 共同线数值
-    getCooldown: function(lv) { return [1.2,1.0,0.8,0.65,0.5,0.4,0.3][lv-1]; },
-    getDamage: function(lv) { return [8,12,14,18,22,26,32][lv-1]; },
+    getCooldown: function(lv) { return [0.9,0.8,0.65,0.5,0.4,0.35,0.3][lv-1]; },
+    getDamage: function(lv) { return [12,15,18,22,24,26,28][lv-1]; },
     getCount: function(lv, branch) {
       if (branch === 'wisdom') return [1,1,2,2,2,3,3][lv-1];
       return [1,1,1,1,2,2,2][lv-1];
@@ -1100,16 +1250,16 @@ const WEAPONS = [
     },
     getSplitCount: function(lv, branch) {
       if (branch !== 'power') return 0;
-      if (lv >= 6) return 5;
-      if (lv >= 5) return 4;
-      if (lv >= 4) return 3;
+      if (lv >= 6) return 3;
+      if (lv >= 5) return 3;
+      if (lv >= 4) return 2;
       if (lv >= 3) return 2;
       return 0;
     },
     getSplitDamageRatio: function(lv) {
-      if (lv >= 6) return 0.5;
-      if (lv >= 4) return 0.4;
-      return 0.3;
+      if (lv >= 5) return 0.25;
+      if (lv >= 3) return 0.2;
+      return 0;
     },
     getHoming: function(lv, branch) {
       if (branch !== 'wisdom') return 0;
@@ -1123,10 +1273,10 @@ const WEAPONS = [
         name: '裂空弹', icon: '💥', theme: 'power',
         desc: '命中敌人后发射碎片，清群利器',
         levels: {
-          3: { name:'裂空弹 · 力量', icon:'💥', desc:'命中→2碎片(30%伤害)' },
-          4: { name:'裂空弹 · 力量', icon:'💥', desc:'碎片→3枚 | 获得穿透×2' },
-          5: { name:'裂空弹 · 力量', icon:'💥', desc:'碎片→4枚 | 穿透保持' },
-          6: { name:'裂空弹 · 力量', icon:'💥', desc:'碎片→5枚(50%) | 穿透×3 | 弹丸×2' },
+          3: { name:'裂空弹 · 力量', icon:'💥', desc:'命中→2碎片(20%伤害)' },
+          4: { name:'裂空弹 · 力量', icon:'💥', desc:'碎片→2枚 | 获得穿透×2' },
+          5: { name:'裂空弹 · 力量', icon:'💥', desc:'碎片强化(25%伤害) | 弹丸×2' },
+          6: { name:'裂空弹 · 力量', icon:'💥', desc:'碎片→3枚 | 穿透×2 | 弹丸×2' },
           7: { name:'裂空弹 · 力量', icon:'💥', desc:'终极形态：碎片满溢' },
         },
       },
@@ -1158,22 +1308,23 @@ const WEAPONS = [
   {
     id:'axe', name:'飞斧', icon:'🪓', desc:'向四周投掷回旋斧', maxLv:5,
     getCooldown: function(lv) { return [1.5,1.3,1.1,0.9,0.7][lv-1]; },
-    getDamage: function(lv) { return [12,16,20,28,36][lv-1]; },
-    getCount: function(lv) { return [1,2,3,4,6][lv-1]; },
+    getDamage: function(lv) { return [12,16,20,28,32][lv-1]; },
+    getCount: function(lv) { return [1,2,3,4,5][lv-1]; },
     _phase: 0,
     update: function(dt) { this._phase += dt*2; },
   },
   {
     id:'shield', name:'圣盾', icon:'🛡️', desc:'围绕自身旋转护盾', maxLv:5,
-    getDamage: function(lv) { return [3,5,8,12,18][lv-1]; },
+    getDamage: function(lv) { return [6,10,16,24,40][lv-1]; },
     getRadius: function(lv) { return [60,75,90,110,130][lv-1]; },
     isContinuous: true,
   },
   {
     id:'fire', name:'烈焰之环', icon:'🔥', desc:'环绕火焰持续灼烧附近敌人', maxLv:5,
-    getDamage: function(lv) { return [2,3,5,7,10][lv-1]; },
+    getDamage: function(lv) { return [8,12,18,24,30][lv-1]; },
     getRadius: function(lv) { return [50,60,75,90,110][lv-1]; },
     isContinuous: true,
+    getDamageInterval: function(lv) { return [0.3,0.28,0.25,0.22,0.2][lv-1]; },
   }
 ];
 
@@ -1183,6 +1334,7 @@ const WeaponSystem = function(player) {
   this._shieldZone = null;
   this._fireZone = null;
   this._axePhase = 0;
+  this._passiveStacks = {};
 };
 WeaponSystem.prototype.addWeapon = function(weaponId, branch) {
   var w = WEAPONS.find(function(w2){ return w2.id===weaponId; });
@@ -1204,8 +1356,9 @@ WeaponSystem.prototype.update = function(dt, em) {
     if (w.isContinuous) { self._updateContinuous(w, slot.level, enemies, em); return; }
     if (w.update) w.update(dt);
     slot.cooldownTimer -= dt;
+    var cdMul = player.cdReduce ? (1 - Math.min(player.cdReduce, 0.5)) : 1;
     if (slot.cooldownTimer <= 0) {
-      slot.cooldownTimer = w.getCooldown(slot.level);
+      slot.cooldownTimer = w.getCooldown(slot.level) * cdMul;
       if (w.id === 'wand') self._fireWand(w, slot.level, player, enemies, em, slot);
       if (w.id === 'axe') self._fireAxe(w, slot.level, player, em);
     }
@@ -1225,12 +1378,13 @@ WeaponSystem.prototype._fireWand = function(w, level, player, enemies, em, slot)
   var homing = w.getHoming(level, branch);
   var splitCount = w.getSplitCount(level, branch);
   var baseDamage = Math.floor(w.getDamage(level)*(player.damageMultiplier||1));
+  var speedMul = player.projSpeedMulti || 1;
   for (var i=0; i<count; i++) {
     var offset = (i - (count-1)/2)*0.25;
     var proj = new Projectile(player.x, player.y, {
       dx:Math.cos(angle+offset), dy:Math.sin(angle+offset),
       damage: baseDamage,
-      speed:260, lifetime:2, color:'#b388ff', type:'magic', w:12, h:12,
+      speed:260 * speedMul, lifetime:2, color:'#b388ff', type:'magic', w:12, h:12,
       piercing: piercing,
       homing: homing,
       onHitSplit: splitCount > 0 ? {
@@ -1248,12 +1402,13 @@ WeaponSystem.prototype._fireWand = function(w, level, player, enemies, em, slot)
 WeaponSystem.prototype._fireAxe = function(w, level, player, em) {
   var count = w.getCount(level);
   this._axePhase = (this._axePhase||0) + 0.5;
+  var speedMul = player.projSpeedMulti || 1;
   for (var i=0; i<count; i++) {
     var angle = (Math.PI*2/count)*i + (this._axePhase||0);
     em.add(new Projectile(player.x, player.y, {
       dx:Math.cos(angle), dy:Math.sin(angle),
       damage:Math.floor(w.getDamage(level)*(player.damageMultiplier||1)),
-      speed:200, lifetime:1.5, color:'#ff6d00', type:'bullet', w:10, h:10, piercing:2,
+      speed:200 * speedMul, lifetime:1.5, color:'#ff6d00', type:'bullet', w:10, h:10, piercing:2,
     }));
   }
 };
@@ -1267,20 +1422,30 @@ WeaponSystem.prototype._updateContinuous = function(weapon, level, enemies, em) 
     this._shieldZone.radius = weapon.getRadius(level);
     enemies.forEach(function(e){
       if (!e.dead && self._shieldZone && self._shieldZone.tryDamageEnemy(e)) {
-        e.takeDamage(Math.floor(weapon.getDamage(level)*(self.player.damageMultiplier||1)), self.player.x, self.player.y);
+        var dmg = Math.floor(weapon.getDamage(level)*(self.player.damageMultiplier||1));
+        var isCrit = self.player.critChance && Math.random() < self.player.critChance;
+        if (isCrit) dmg = Math.floor(dmg * (self.player.critMulti || 2));
+        e.takeDamage(dmg, self.player.x, self.player.y);
+        spawnDamageNumber(e.x, e.y - e.h/2, dmg, isCrit);
         if (e.dead) { Spawner.onEnemyDeath(e, em); self.player.kills++; }
       }
     });
   }
   if (weapon.id === 'fire') {
+    var dmgInterval = weapon.getDamageInterval ? weapon.getDamageInterval(level) : 0.3;
     if (!this._fireZone || this._fireZone.dead) {
-      this._fireZone = new DamageZone(this.player, {radius:weapon.getRadius(level), damage:0, damageInterval:0.5, lifetime:0, color:'#ff6d00'});
+      this._fireZone = new DamageZone(this.player, {radius:weapon.getRadius(level), damage:0, damageInterval:dmgInterval, lifetime:0, color:'#ff6d00'});
       em.add(this._fireZone);
     }
     this._fireZone.radius = weapon.getRadius(level);
+    this._fireZone.damageInterval = dmgInterval;
     enemies.forEach(function(e){
       if (!e.dead && self._fireZone && self._fireZone.tryDamageEnemy(e)) {
-        e.takeDamage(Math.floor(weapon.getDamage(level)*(self.player.damageMultiplier||1)), self.player.x, self.player.y);
+        var dmg = Math.floor(weapon.getDamage(level)*(self.player.damageMultiplier||1));
+        var isCrit = self.player.critChance && Math.random() < self.player.critChance;
+        if (isCrit) dmg = Math.floor(dmg * (self.player.critMulti || 2));
+        e.takeDamage(dmg, self.player.x, self.player.y);
+        spawnDamageNumber(e.x, e.y - e.h/2, dmg, isCrit);
         if (e.dead) { Spawner.onEnemyDeath(e, em); self.player.kills++; }
       }
     });
@@ -1319,12 +1484,28 @@ WeaponSystem.prototype.getUpgradeOptions = function(count) {
   WEAPONS.filter(function(w){ return !owned.includes(w.id); }).forEach(function(w){
     options.push({type:'new', weaponId:w.id, name:w.name, icon:w.icon, desc:w.desc, level:1});
   });
-  options.push(
-    {type:'passive', stat:'damage', name:'攻击强化', icon:'⚔️', desc:'伤害倍率 +20%'},
-    {type:'passive', stat:'speed', name:'移动加速', icon:'👟', desc:'移动速度 +15%'},
-    {type:'passive', stat:'maxHp', name:'生命上限', icon:'❤️', desc:'最大生命 +30'},
-    {type:'passive', stat:'pickup', name:'拾取范围', icon:'🧲', desc:'拾取范围 +30%'}
-  );
+  var passivePool = [
+    {type:'passive', stat:'damage', name:'攻击强化', icon:'⚔️', desc:'伤害倍率 +20%', maxStack:99},
+    {type:'passive', stat:'speed', name:'移动加速', icon:'👟', desc:'移动速度 +15%', maxStack:99},
+    {type:'passive', stat:'maxHp', name:'生命上限', icon:'❤️', desc:'最大生命 +30', maxStack:99},
+    {type:'passive', stat:'pickup', name:'拾取范围', icon:'🧲', desc:'拾取范围 +30%', maxStack:99},
+    {type:'passive', stat:'crit', name:'暴击大师', icon:'🎯', desc:'暴击率 +10%（2倍伤害）', maxStack:5},
+    {type:'passive', stat:'cdreduce', name:'冷却缩减', icon:'⏳', desc:'武器冷却 -8%', maxStack:5},
+    {type:'passive', stat:'magnet', name:'经验磁铁', icon:'🧭', desc:'拾取范围 +25%', maxStack:5},
+    {type:'passive', stat:'armor', name:'护甲强化', icon:'🛡️', desc:'护甲 +3', maxStack:5},
+    {type:'passive', stat:'regen', name:'生命回复', icon:'💚', desc:'每秒回复 1 HP', maxStack:5},
+    {type:'passive', stat:'projSpeed', name:'弹速强化', icon:'💨', desc:'弹丸速度 +15%', maxStack:5}
+  ];
+  // 被动叠加次数追踪
+  if (!this._passiveStacks) this._passiveStacks = {};
+  passivePool.forEach(function(p){
+    var stack = self._passiveStacks[p.stat] || 0;
+    if (stack < p.maxStack) {
+      var desc = p.desc;
+      if (stack > 0) desc += ' (已叠加' + stack + '次)';
+      options.push({type:'passive', stat:p.stat, name:p.name, icon:p.icon, desc:desc, maxStack:p.maxStack});
+    }
+  });
   for (var i=options.length-1; i>0; i--) { var j=Math.floor(Math.random()*(i+1)); var tmp=options[i]; options[i]=options[j]; options[j]=tmp; }
   return options.slice(0, count);
 };
@@ -1339,11 +1520,35 @@ WeaponSystem.prototype.applyUpgrade = function(option) {
   }
   if (option.type==='new') return this.addWeapon(option.weaponId);
   if (option.type==='passive') {
+    if (!this._passiveStacks) this._passiveStacks = {};
+    this._passiveStacks[option.stat] = (this._passiveStacks[option.stat] || 0) + 1;
     switch(option.stat){
       case 'damage': this.player.damageMultiplier += 0.2; break;
       case 'speed': this.player.speed *= 1.15; break;
       case 'maxHp': this.player.maxHp += 30; this.player.hp = Math.min(this.player.hp+30, this.player.maxHp); break;
-      case 'pickup': this.player.pickupRange += 30; break;
+      case 'pickup': this.player.pickupRange *= 1.3; break;
+      case 'crit':
+        if (!this.player.critChance) this.player.critChance = 0;
+        this.player.critChance += 0.10;
+        if (!this.player.critMulti) this.player.critMulti = 2;
+        break;
+      case 'cdreduce':
+        if (!this.player.cdReduce) this.player.cdReduce = 0;
+        this.player.cdReduce += 0.08;
+        break;
+      case 'magnet': this.player.pickupRange *= 1.25; break;
+      case 'armor':
+        if (!this.player.armor) this.player.armor = 0;
+        this.player.armor += 3;
+        break;
+      case 'regen':
+        if (!this.player.hpRegen) this.player.hpRegen = 0;
+        this.player.hpRegen += 1;
+        break;
+      case 'projSpeed':
+        if (!this.player.projSpeedMulti) this.player.projSpeedMulti = 1;
+        this.player.projSpeedMulti *= 1.15;
+        break;
     }
     return {passive:true, name:option.name};
   }
@@ -1493,8 +1698,13 @@ function update(dt) {
       if (proj.dead || enemy.dead) return;
       if (proj.overlaps(enemy)) {
         if (proj.hitEnemy(enemy)) {
-          var died = enemy.takeDamage(Math.floor(proj.damage * (player.damageMultiplier||1)), proj.x, proj.y);
+          var dmg = Math.floor(proj.damage * (player.damageMultiplier||1));
+          // 暴击判定
+          var isCrit = player.critChance && Math.random() < player.critChance;
+          if (isCrit) dmg = Math.floor(dmg * (player.critMulti || 2));
+          var died = enemy.takeDamage(dmg, proj.x, proj.y);
           if (died) { Spawner.onEnemyDeath(enemy, em); player.kills++; }
+          spawnDamageNumber(enemy.x, enemy.y - enemy.h/2, dmg, isCrit);
           // 分裂碎片（裂空弹）
           if (proj.onHitSplit) {
             var sc = proj.onHitSplit;
@@ -1530,8 +1740,17 @@ function update(dt) {
     if (enemy.overlaps(player)) {
       if (enemy.canAttack()) {
         enemy.onAttack();
-        player.takeDamage(enemy.damage);
-        spawnDamageNumber(player.x, player.y-20, enemy.damage);
+        var dmgAmount = enemy.damage;
+        // 幽灵隐身状态下伤害减半
+        if (enemy.typeName === 'ghost' && enemy.phaseAlpha < 0.5) {
+          dmgAmount = Math.max(1, Math.floor(dmgAmount * 0.5));
+        }
+        player.takeDamage(dmgAmount);
+        spawnDamageNumber(player.x, player.y-20, dmgAmount);
+        // 僵尸攻击附带减速效果
+        if (enemy.typeName === 'zombie') {
+          player.slowTimer = (enemy.slowOnHit || 0.6);
+        }
       }
     }
   });
@@ -1708,13 +1927,19 @@ function showGameOver() {
   $('go-stats').innerHTML = '等级: <span>'+player.level+'</span><br>击杀: <span>'+player.kills+'</span><br>经验: <span>'+player.xp+'</span>';
 }
 
-function spawnDamageNumber(x, y, amount) {
+function spawnDamageNumber(x, y, amount, isCrit) {
   var el = document.createElement('div');
   el.className = 'dmg-number';
   el.textContent = '-'+amount;
   el.style.left = (x-camera.x+Math.random()*30-15)+'px';
   el.style.top = (y-camera.y-20)+'px';
-  el.style.color = '#ff6b6b';
+  if (isCrit) {
+    el.style.color = '#ffd60a';
+    el.style.fontSize = '20px';
+    el.style.textShadow = '0 0 6px rgba(255,214,10,0.8)';
+  } else {
+    el.style.color = '#ff6b6b';
+  }
   $('ui-overlay').appendChild(el);
   setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 800);
 }
