@@ -165,8 +165,12 @@ EntityManager.prototype.update = function(dt) {
   var dead = [];
   var self = this;
   this.entities.forEach(function(e){
-    if (e instanceof Player) return; // 玩家在主循环中单独更新
-    if (e instanceof Enemy) {
+    if (e instanceof Player) return;          // 主循环单独更新
+    if (e instanceof Enemy) {                 // 主循环单独更新
+      if (e.dead) dead.push(e);
+      return;
+    }
+    if (e instanceof EnemyProjectile) {       // 主循环单独更新
       if (e.dead) dead.push(e);
       return;
     }
@@ -311,12 +315,17 @@ Player.prototype.render = function(ctx, cam) {
 
 // ============ Enemy ============
 const ENEMY_TYPES = {
-  bat:     {name:'蝙蝠', hp:8,   speed:100, damage:5,  w:18, h:18, xp:1,  color:'#8338ec', attackCooldown:1.0, mass:0.5},
-  zombie:  {name:'僵尸', hp:25,  speed:45,  damage:10, w:24, h:24, xp:3,  color:'#2d6a4f', attackCooldown:1.2, mass:1.0},
-  skeleton:{name:'骷髅', hp:40,  speed:65,  damage:12, w:22, h:22, xp:5,  color:'#e9ecef', attackCooldown:0.8, mass:0.8},
-  ghost:   {name:'幽灵', hp:30,  speed:110, damage:8,  w:20, h:20, xp:6,  color:'#adb5bd', attackCooldown:0.6, mass:0.3},
-  demon:   {name:'恶魔', hp:100, speed:50,  damage:20, w:30, h:30, xp:15, color:'#d00000', attackCooldown:1.5, mass:1.5},
-  boss:    {name:'BOSS', hp:500, speed:35,  damage:30, w:48, h:48, xp:50, color:'#ff006e', attackCooldown:2.0, mass:3.0},
+  bat:     {name:'蝙蝠',   hp:8,   speed:100, damage:5,  w:18, h:18, xp:1,  color:'#8338ec', attackCooldown:1.0, mass:0.5},
+  zombie:  {name:'僵尸',   hp:25,  speed:45,  damage:10, w:24, h:24, xp:3,  color:'#2d6a4f', attackCooldown:1.2, mass:1.0},
+  skeleton:{name:'骷髅',   hp:40,  speed:65,  damage:12, w:22, h:22, xp:5,  color:'#e9ecef', attackCooldown:0.8, mass:0.8},
+  ghost:   {name:'幽灵',   hp:30,  speed:110, damage:8,  w:20, h:20, xp:6,  color:'#adb5bd', attackCooldown:0.6, mass:0.3},
+  demon:   {name:'恶魔',   hp:100, speed:50,  damage:20, w:30, h:30, xp:15, color:'#d00000', attackCooldown:1.5, mass:1.5},
+  boss:    {name:'BOSS',   hp:500, speed:35,  damage:30, w:48, h:48, xp:50, color:'#ff006e', attackCooldown:2.0, mass:3.0},
+  // 新增特殊敌人
+  slime:      {name:'史莱姆', hp:50,  speed:40,  damage:8,  w:28, h:28, xp:6,  color:'#22c55e', attackCooldown:1.0, mass:2.5}, // 分裂型
+  slime_small:{name:'小史莱姆',hp:15, speed:55,  damage:5,  w:16, h:16, xp:2,  color:'#86efac', attackCooldown:1.0, mass:1.0}, // 不再分裂
+  archer:     {name:'弓骷髅', hp:45,  speed:60,  damage:8,  w:22, h:22, xp:7,  color:'#f0e68c', attackCooldown:2.0, mass:0.7}, // 远程型，接触伤害低
+  bomber:     {name:'爆炸幽灵',hp:20,  speed:130, damage:18, w:22, h:22, xp:8,  color:'#ff4d4d', attackCooldown:999, mass:0.4}, // 接触引爆，无普通攻击
 };
 const Enemy = function(x, y, typeName, diffScale) {
   var type = ENEMY_TYPES[typeName];
@@ -333,17 +342,31 @@ const Enemy = function(x, y, typeName, diffScale) {
   this.xpValue = type.xp;
   this.hitFlashTimer = 0;
   this.animPhase = Math.random()*Math.PI*2;
-  this.pushVx = 0; this.pushVy = 0; // 受击击退速度
+  this.pushVx = 0; this.pushVy = 0;
+  this.diffScale = diffScale || 1;
+
+  // 弓骷髅：远程攻击计时器
+  if (typeName === 'archer') {
+    this.shootTimer = 1.0 + Math.random(); // 随机错开首次射击
+  }
+  // 爆炸幽灵：闪烁预警状态
+  if (typeName === 'bomber') {
+    this.explodeRange = 80;   // 爆炸触发半径
+    this.blinkTimer = 0;      // 闪烁计时（靠近时触发）
+    this.blinking = false;    // 是否已进入预警
+    this.blinkSpeed = 8;      // 闪烁频率
+  }
 };
 Enemy.prototype = Object.create(Entity.prototype);
 Enemy.prototype.constructor = Enemy;
-Enemy.prototype.moveToward = function(tx, ty, dt, enemies) {
+Enemy.prototype.moveToward = function(tx, ty, dt, enemies, overrideSpeed) {
   var dx = tx-this.x, dy = ty-this.y;
   var dist = Math.sqrt(dx*dx+dy*dy);
+  var spd = overrideSpeed !== undefined ? overrideSpeed : this.speed;
   var vx = 0, vy = 0;
   if (dist > 2) {
-    vx = (dx/dist)*this.speed;
-    vy = (dy/dist)*this.speed;
+    vx = (dx/dist)*spd;
+    vy = (dy/dist)*spd;
   }
   // 简单的敌人之间推开（避免完全重叠）
   var self = this;
@@ -398,22 +421,189 @@ Enemy.prototype.canAttack = function() {
 Enemy.prototype.onAttack = function() {
   this.attackTimer = this.attackCooldown;
 };
-Enemy.prototype.update = function(dt, px, py, enemies) {
+Enemy.prototype.update = function(dt, px, py, enemies, em) {
   if (this.dead) return;
-  this.moveToward(px, py, dt, enemies);
+
+  // ---- 弓骷髅 AI：保持距离，远程射箭 ----
+  if (this.typeName === 'archer') {
+    var dx = px - this.x, dy = py - this.y;
+    var dist = Math.sqrt(dx*dx + dy*dy);
+    var preferDist = 320; // 希望保持的距离
+    var vx = 0, vy = 0;
+    if (dist > 0.1) {
+      if (dist > preferDist + 40) {
+        // 太远：靠近
+        vx = (dx/dist) * this.speed;
+        vy = (dy/dist) * this.speed;
+      } else if (dist < preferDist - 40) {
+        // 太近：后退
+        vx = -(dx/dist) * this.speed * 0.8;
+        vy = -(dy/dist) * this.speed * 0.8;
+      } else {
+        // 适距：横向移动（绕圈）
+        vx = -dy/dist * this.speed * 0.5;
+        vy = dx/dist * this.speed * 0.5;
+      }
+    }
+    // 推开逻辑
+    var self = this;
+    if (enemies) {
+      enemies.forEach(function(other){
+        if (other === self || other.dead) return;
+        var odx = self.x - other.x, ody = self.y - other.y;
+        var odist = Math.sqrt(odx*odx + ody*ody);
+        var minDist = (self.w + other.w) * 0.4;
+        if (odist < minDist && odist > 0.1) {
+          var push = (minDist - odist) * 5;
+          vx += (odx/odist) * push;
+          vy += (ody/odist) * push;
+        }
+      });
+    }
+    this.pushVx *= 0.9; this.pushVy *= 0.9;
+    vx += this.pushVx; vy += this.pushVy;
+    this.x += vx * dt; this.y += vy * dt;
+    var clamped = clampPosition(this.x, this.y, this.w/2, this.h/2);
+    this.x = clamped.x; this.y = clamped.y;
+    this.animPhase += dt * 5;
+    // 射箭计时
+    if (this.shootTimer > 0) this.shootTimer -= dt;
+    if (this.attackTimer > 0) this.attackTimer -= dt;
+    if (this.hitFlashTimer > 0) this.hitFlashTimer -= dt;
+    return;
+  }
+
+  // ---- 爆炸幽灵 AI：快速追踪，靠近后闪烁预警再爆 ----
+  if (this.typeName === 'bomber') {
+    var dx = px - this.x, dy = py - this.y;
+    var dist = Math.sqrt(dx*dx + dy*dy);
+    var spd = this.speed;
+    if (dist < 150) spd *= 1.4; // 靠近时加速
+    this.moveToward(px, py, dt, enemies, spd);
+    // 闪烁预警：距离 < 80px 时开始闪
+    if (dist < 80 && !this.blinking) {
+      this.blinking = true;
+      this.blinkTimer = 0;
+    }
+    if (this.blinking) {
+      this.blinkTimer += dt;
+      this.blinkSpeed = 8 + this.blinkTimer * 6; // 越来越快
+    }
+    if (this.attackTimer > 0) this.attackTimer -= dt;
+    if (this.hitFlashTimer > 0) this.hitFlashTimer -= dt;
+    return;
+  }
+
+  // ---- 普通 AI ----
+  this.moveToward(px, py, dt, enemies, this.speed);
   if (this.attackTimer > 0) this.attackTimer -= dt;
   if (this.hitFlashTimer > 0) this.hitFlashTimer -= dt;
 };
 Enemy.prototype.render = function(ctx, cam) {
   if (this.dead) return;
   var sx = this.x-cam.x, sy = this.y-cam.y, r = this.w/2;
+
+  // ---- 史莱姆：果冻形，带内部高光 ----
+  if (this.typeName === 'slime' || this.typeName === 'slime_small') {
+    var squish = 1 + Math.sin(this.animPhase) * 0.08;
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.scale(squish, 1/squish);
+    ctx.fillStyle = this.hitFlashTimer > 0 ? '#fff' : this.color;
+    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.fill();
+    // 高光
+    ctx.fillStyle = 'rgba(255,255,255,0.35)';
+    ctx.beginPath(); ctx.ellipse(-r*0.2, -r*0.3, r*0.35, r*0.2, -0.5, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+    // 眼睛（横向拉伸的小眼）
+    ctx.fillStyle = '#111';
+    ctx.beginPath(); ctx.ellipse(sx-r*0.3, sy-r*0.1, r*0.18, r*0.13, 0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(sx+r*0.3, sy-r*0.1, r*0.18, r*0.13, 0, 0, Math.PI*2); ctx.fill();
+    if (this.hp > 0 && this.hp < this.maxHp) {
+      var barW = this.w+4, barH = 3;
+      ctx.fillStyle = '#333'; ctx.fillRect(sx-barW/2, sy-r-8, barW, barH);
+      ctx.fillStyle = '#22c55e'; ctx.fillRect(sx-barW/2, sy-r-8, barW*(this.hp/this.maxHp), barH);
+    }
+    return;
+  }
+
+  // ---- 弓骷髅：骷髅头 + 弓形装饰 ----
+  if (this.typeName === 'archer') {
+    var flash = this.hitFlashTimer > 0;
+    // 主体（骷髅圆头）
+    ctx.fillStyle = flash ? '#fff' : this.color;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.fill();
+    // 骷髅颌骨
+    ctx.fillStyle = flash ? '#fff' : '#ccc';
+    ctx.fillRect(sx-r*0.4, sy+r*0.2, r*0.8, r*0.35);
+    ctx.fillStyle = flash ? '#fff' : this.color;
+    ctx.fillRect(sx-r*0.3, sy+r*0.28, r*0.22, r*0.25);
+    ctx.fillRect(sx+r*0.08, sy+r*0.28, r*0.22, r*0.25);
+    // 眼睛（骷髅空洞）
+    ctx.fillStyle = flash ? '#e63946' : '#111';
+    ctx.beginPath(); ctx.ellipse(sx-r*0.3, sy-r*0.15, r*0.22, r*0.18, 0, 0, Math.PI*2); ctx.fill();
+    ctx.beginPath(); ctx.ellipse(sx+r*0.3, sy-r*0.15, r*0.22, r*0.18, 0, 0, Math.PI*2); ctx.fill();
+    // 弓（弧形线条）
+    ctx.strokeStyle = flash ? '#fff' : '#a0522d';
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.arc(sx+r*1.1, sy, r*0.8, Math.PI*0.6, Math.PI*1.4);
+    ctx.stroke();
+    ctx.strokeStyle = flash ? '#fff' : '#ffd700';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(sx+r*1.1, sy-r*0.64);
+    ctx.lineTo(sx+r*1.1, sy+r*0.64);
+    ctx.stroke();
+    if (this.hp > 0 && this.hp < this.maxHp) {
+      var barW = this.w+4, barH = 3;
+      ctx.fillStyle = '#333'; ctx.fillRect(sx-barW/2, sy-r-8, barW, barH);
+      ctx.fillStyle = '#f0e68c'; ctx.fillRect(sx-barW/2, sy-r-8, barW*(this.hp/this.maxHp), barH);
+    }
+    return;
+  }
+
+  // ---- 爆炸幽灵：闪烁红色圆球，边缘有火焰粒子感 ----
+  if (this.typeName === 'bomber') {
+    var showBright = !this.blinking || (Math.floor(this.blinkTimer * this.blinkSpeed) % 2 === 0);
+    var baseColor = showBright ? this.color : '#ff9900';
+    ctx.fillStyle = this.hitFlashTimer > 0 ? '#fff' : baseColor;
+    ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.fill();
+    // 内核（白色中心）
+    ctx.fillStyle = 'rgba(255,255,255,0.4)';
+    ctx.beginPath(); ctx.arc(sx, sy, r*0.45, 0, Math.PI*2); ctx.fill();
+    // 爆炸范围预警圈（靠近时显示）
+    if (this.blinking) {
+      var alpha = 0.15 + Math.sin(this.blinkTimer * this.blinkSpeed * Math.PI) * 0.15;
+      ctx.strokeStyle = 'rgba(255,77,0,' + (alpha+0.3) + ')';
+      ctx.lineWidth = 2;
+      ctx.setLineDash([4,4]);
+      ctx.beginPath(); ctx.arc(sx, sy, this.explodeRange, 0, Math.PI*2); ctx.stroke();
+      ctx.setLineDash([]);
+    }
+    // 眼睛（X型）
+    ctx.strokeStyle = this.hitFlashTimer > 0 ? '#e63946' : '#111';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(sx-r*0.35, sy-r*0.3); ctx.lineTo(sx-r*0.1, sy-r*0.05);
+    ctx.moveTo(sx-r*0.1, sy-r*0.3); ctx.lineTo(sx-r*0.35, sy-r*0.05);
+    ctx.moveTo(sx+r*0.1, sy-r*0.3); ctx.lineTo(sx+r*0.35, sy-r*0.05);
+    ctx.moveTo(sx+r*0.35, sy-r*0.3); ctx.lineTo(sx+r*0.1, sy-r*0.05);
+    ctx.stroke();
+    if (this.hp > 0 && this.hp < this.maxHp) {
+      var barW = this.w+4, barH = 3;
+      ctx.fillStyle = '#333'; ctx.fillRect(sx-barW/2, sy-r-8, barW, barH);
+      ctx.fillStyle = '#ff4d4d'; ctx.fillRect(sx-barW/2, sy-r-8, barW*(this.hp/this.maxHp), barH);
+    }
+    return;
+  }
+
+  // ---- 普通敌人渲染 ----
   ctx.fillStyle = this.hitFlashTimer > 0 ? '#fff' : this.color;
   ctx.beginPath(); ctx.arc(sx, sy, r, 0, Math.PI*2); ctx.fill();
-  // 眼睛
   ctx.fillStyle = this.hitFlashTimer > 0 ? '#e63946' : '#ff006e';
   ctx.beginPath(); ctx.arc(sx-r*0.3, sy-r*0.15, r*0.2, 0, Math.PI*2); ctx.fill();
   ctx.beginPath(); ctx.arc(sx+r*0.3, sy-r*0.15, r*0.2, 0, Math.PI*2); ctx.fill();
-  // 血条
   if (this.hp > 0 && this.hp < this.maxHp) {
     var barW = this.w+4, barH = 3;
     ctx.fillStyle = '#333'; ctx.fillRect(sx-barW/2, sy-r-8, barW, barH);
@@ -480,6 +670,53 @@ Projectile.prototype.render = function(ctx, cam) {
   }
 };
 
+// ============ EnemyProjectile（敌方弹丸：弓骷髅的箭、爆炸幽灵死亡弹幕）============
+const EnemyProjectile = function(x, y, config) {
+  Entity.call(this, x, y, config.w||8, config.h||8);
+  this.vx = config.vx || 0;
+  this.vy = config.vy || 0;
+  this.damage = config.damage || 5;
+  this.lifetime = config.lifetime || 3;
+  this.color = config.color || '#ffd60a';
+  this.type = config.type || 'arrow'; // 'arrow' | 'death_orb'
+  this.hasHit = false;
+};
+EnemyProjectile.prototype = Object.create(Entity.prototype);
+EnemyProjectile.prototype.constructor = EnemyProjectile;
+EnemyProjectile.prototype.update = function(dt) {
+  this.x += this.vx * dt;
+  this.y += this.vy * dt;
+  this.lifetime -= dt;
+  if (this.lifetime <= 0) this.dead = true;
+  // 飞出竞技场就消失
+  if (Math.abs(this.x) > WORLD.halfW + 50 || Math.abs(this.y) > WORLD.halfH + 50) this.dead = true;
+};
+EnemyProjectile.prototype.render = function(ctx, cam) {
+  var sx = this.x - cam.x, sy = this.y - cam.y;
+  if (this.type === 'arrow') {
+    // 细长箭矢
+    var angle = Math.atan2(this.vy, this.vx);
+    ctx.save();
+    ctx.translate(sx, sy);
+    ctx.rotate(angle);
+    ctx.fillStyle = this.color;
+    ctx.beginPath();
+    ctx.moveTo(10, 0); ctx.lineTo(0, -2.5); ctx.lineTo(-4, 0); ctx.lineTo(0, 2.5);
+    ctx.closePath(); ctx.fill();
+    // 箭杆
+    ctx.strokeStyle = '#cc2222';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(-4, 0); ctx.lineTo(-10, 0); ctx.stroke();
+    ctx.restore();
+  } else {
+    // 死亡弹幕小圆球
+    ctx.fillStyle = this.color;
+    ctx.beginPath(); ctx.arc(sx, sy, this.w/2, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,0.5)';
+    ctx.beginPath(); ctx.arc(sx-this.w*0.15, sy-this.w*0.15, this.w*0.2, 0, Math.PI*2); ctx.fill();
+  }
+};
+
 // ============ XpGem ============
 const XpGem = function(x, y, value) {
   var tiers = [
@@ -525,6 +762,88 @@ XpGem.prototype.render = function(ctx, cam) {
   ctx.fillStyle = 'rgba(255,255,255,0.4)';
   ctx.beginPath(); ctx.moveTo(sx,sy-r); ctx.lineTo(sx+r*0.3,sy-r*0.2); ctx.lineTo(sx,sy); ctx.lineTo(sx-r*0.3,sy-r*0.2); ctx.closePath(); ctx.fill();
 };
+
+// ============ HealthPotion 回血道具 ============
+const POTION_TYPES = {
+  small:   {heal:20, color:'#4ade80', size:10, w:16, h:16},
+  large:   {heal:50, color:'#22c55e', size:14, w:20, h:20},
+  chicken: {heal:0,  color:'#f59e0b', size:16, w:24, h:24}, // heal=0 表示回复50%最大生命
+};
+const HealthPotion = function(x, y, typeName) {
+  var type = POTION_TYPES[typeName];
+  Entity.call(this, x, y, type.w, type.h);
+  this.typeName = typeName;
+  this.heal = type.heal;
+  this.color = type.color;
+  this.size = type.size;
+  this.bobPhase = Math.random()*Math.PI*2;
+  this.magnetized = false;
+  this.pickupRange = 50;
+};
+HealthPotion.prototype = Object.create(Entity.prototype);
+HealthPotion.prototype.constructor = HealthPotion;
+HealthPotion.prototype.update = function(dt, px, py, pickupRange) {
+  this.bobPhase += dt*3;
+  this.pickupRange = pickupRange || 50;
+  var dx = px-this.x, dy = py-this.y;
+  var dist = Math.sqrt(dx*dx+dy*dy);
+  if (dist < this.pickupRange + 40) this.magnetized = true;
+  if (this.magnetized) {
+    if (dist > 0) {
+      var speed = 350;
+      this.x += (dx/dist)*speed*dt;
+      this.y += (dy/dist)*speed*dt;
+      dx = px-this.x; dy = py-this.y;
+      dist = Math.sqrt(dx*dx+dy*dy);
+    }
+    if (dist < 18) { this.dead = true; return this.typeName; }
+  }
+  return null;
+};
+HealthPotion.prototype.render = function(ctx, cam) {
+  var sx = this.x-cam.x, sy = this.y-cam.y + Math.sin(this.bobPhase)*3;
+  var type = POTION_TYPES[this.typeName];
+  // 瓶子形状
+  ctx.fillStyle = type.color;
+  ctx.beginPath();
+  ctx.moveTo(sx-this.size*0.4, sy-this.size*0.3);
+  ctx.lineTo(sx+this.size*0.4, sy-this.size*0.3);
+  ctx.lineTo(sx+this.size*0.35, sy+this.size*0.3);
+  ctx.lineTo(sx-this.size*0.35, sy+this.size*0.3);
+  ctx.closePath(); ctx.fill();
+  // 瓶口
+  ctx.fillStyle = '#a1a1aa';
+  ctx.fillRect(sx-this.size*0.15, sy-this.size*0.5, this.size*0.3, this.size*0.2);
+  // 十字（医疗标志）
+  ctx.fillStyle = '#fff';
+  ctx.fillRect(sx-1, sy-this.size*0.15, 2, this.size*0.3);
+  ctx.fillRect(sx-this.size*0.15, sy-1, this.size*0.3, 2);
+  // 光晕
+  ctx.strokeStyle = type.color+'40';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(sx, sy, this.size, 0, Math.PI*2); ctx.stroke();
+};
+
+// 掉落概率（参考 Vampire Survivors 的 Floor Chicken 机制）
+// 普通敌人：小血瓶 15%，大血瓶 3%
+// 精英/幽灵/骷髅：小血瓶 30%，大血瓶 10%
+// BOSS：小血瓶 100%，大血瓶 50%，Floor Chicken（回复50%HP）25%
+function rollHealthDrop(enemyTypeName) {
+  var isBoss = enemyTypeName === 'boss';
+  var isElite = (enemyTypeName === 'demon' || enemyTypeName === 'ghost' || enemyTypeName === 'skeleton' || enemyTypeName === 'archer');
+  // bomber 死亡后已经很危险，给稍高的血瓶概率作为补偿
+  var isBomber = enemyTypeName === 'bomber';
+  if (isBoss) {
+    if (Math.random() < 0.25) return 'chicken';
+    if (Math.random() < 0.5) return 'large';
+    return 'small';
+  }
+  var smallChance = isBomber ? 0.35 : (isElite ? 0.30 : 0.15);
+  var largeChance = isBomber ? 0.12 : (isElite ? 0.10 : 0.03);
+  if (Math.random() < largeChance) return 'large';
+  if (Math.random() < smallChance) return 'small';
+  return null;
+}
 
 // ============ DamageZone ============
 const DamageZone = function(owner, config) {
@@ -582,16 +901,16 @@ DamageZone.prototype.render = function(ctx, cam) {
 // ============ Spawner ============
 // 波次配置：每波持续秒数、敌人类型权重、生成间隔、同屏上限、难度倍率
 const WAVES = [
-  { duration: 20,  pool:[{type:'bat',w:1}],        interval:1.2, maxEnemies:15,  diff:1.0 },
-  { duration: 25,  pool:[{type:'bat',w:2},{type:'zombie',w:1}], interval:1.0, maxEnemies:20,  diff:1.2 },
-  { duration: 25,  pool:[{type:'bat',w:1},{type:'zombie',w:2}], interval:0.9, maxEnemies:25,  diff:1.4 },
-  { duration: 30,  pool:[{type:'zombie',w:2},{type:'skeleton',w:1}], interval:0.8, maxEnemies:30,  diff:1.6 },
-  { duration: 30,  pool:[{type:'zombie',w:1},{type:'skeleton',w:2},{type:'ghost',w:1}], interval:0.7, maxEnemies:35,  diff:1.8 },
-  { duration: 30,  pool:[{type:'skeleton',w:2},{type:'ghost',w:2}], interval:0.6, maxEnemies:40,  diff:2.0 },
-  { duration: 35,  pool:[{type:'ghost',w:2},{type:'demon',w:1}], interval:0.5, maxEnemies:45,  diff:2.3 },
-  { duration: 35,  pool:[{type:'skeleton',w:1},{type:'ghost',w:2},{type:'demon',w:2}], interval:0.45, maxEnemies:50, diff:2.6 },
-  { duration: 40,  pool:[{type:'demon',w:3}], interval:0.4, maxEnemies:55, diff:3.0 },
-  { duration: 60,  pool:[{type:'demon',w:2},{type:'ghost',w:2}], interval:0.35, maxEnemies:60, diff:3.5 },
+  { duration: 20, pool:[{type:'bat',w:1}],                                              interval:1.2, maxEnemies:15, diff:1.0 },
+  { duration: 25, pool:[{type:'bat',w:2},{type:'zombie',w:1}],                          interval:1.0, maxEnemies:20, diff:1.2 },
+  { duration: 25, pool:[{type:'bat',w:1},{type:'zombie',w:2},{type:'slime',w:1}],       interval:0.9, maxEnemies:22, diff:1.4 }, // 史莱姆登场
+  { duration: 30, pool:[{type:'zombie',w:2},{type:'skeleton',w:1},{type:'archer',w:1}], interval:0.8, maxEnemies:25, diff:1.6 }, // 弓骷髅登场
+  { duration: 30, pool:[{type:'zombie',w:1},{type:'skeleton',w:2},{type:'bomber',w:1}], interval:0.7, maxEnemies:28, diff:1.8 }, // 爆炸幽灵登场
+  { duration: 30, pool:[{type:'skeleton',w:2},{type:'ghost',w:2},{type:'slime',w:1},{type:'archer',w:1}], interval:0.6, maxEnemies:32, diff:2.0 },
+  { duration: 35, pool:[{type:'ghost',w:2},{type:'demon',w:1},{type:'bomber',w:1}],     interval:0.5, maxEnemies:35, diff:2.3 },
+  { duration: 35, pool:[{type:'skeleton',w:1},{type:'ghost',w:2},{type:'demon',w:2},{type:'archer',w:1},{type:'bomber',w:1}], interval:0.45, maxEnemies:40, diff:2.6 },
+  { duration: 40, pool:[{type:'demon',w:2},{type:'slime',w:2},{type:'bomber',w:1}],     interval:0.4, maxEnemies:45, diff:3.0 },
+  { duration: 60, pool:[{type:'demon',w:2},{type:'ghost',w:2},{type:'archer',w:1},{type:'bomber',w:2}], interval:0.35, maxEnemies:50, diff:3.5 },
 ];
 const Spawner = function() {
   this.waveIndex = 0;
@@ -653,10 +972,49 @@ Spawner.prototype._spawnBoss = function(player, em) {
 Spawner.onEnemyDeath = function(enemy, em) {
   if (enemy.dead) em.remove(enemy);
   var type = ENEMY_TYPES[enemy.typeName];
+  // 经验宝石
   var count = enemy.typeName === 'boss' ? 5 : (1 + Math.floor(Math.random()*2));
   for (var i=0; i<count; i++) {
     var ox = (Math.random()-0.5)*30, oy = (Math.random()-0.5)*30;
     em.add(new XpGem(enemy.x+ox, enemy.y+oy, type.xp));
+  }
+  // 回血道具掉落
+  var potionType = rollHealthDrop(enemy.typeName);
+  if (potionType) {
+    em.add(new HealthPotion(enemy.x + (Math.random()-0.5)*20, enemy.y + (Math.random()-0.5)*20, potionType));
+  }
+
+  // ---- 史莱姆分裂：死亡生成 2-3 只小史莱姆 ----
+  if (enemy.typeName === 'slime') {
+    var splitCount = 2 + Math.floor(Math.random()*2); // 2或3
+    for (var s=0; s<splitCount; s++) {
+      var angle = (Math.PI*2/splitCount)*s + Math.random()*0.5;
+      var sx = enemy.x + Math.cos(angle)*20;
+      var sy = enemy.y + Math.sin(angle)*20;
+      var small = new Enemy(sx, sy, 'slime_small', enemy.diffScale);
+      small.pushVx = Math.cos(angle)*80;
+      small.pushVy = Math.sin(angle)*80;
+      em.add(small);
+    }
+  }
+
+  // ---- 爆炸幽灵：死亡后 8 方向弹幕 ----
+  if (enemy.typeName === 'bomber') {
+    var bulletCount = 8;
+    var bulletDamage = Math.floor(enemy.damage * 0.6);
+    for (var b=0; b<bulletCount; b++) {
+      var bAngle = (Math.PI*2/bulletCount)*b;
+      var speed = 90 + Math.random()*40;
+      em.add(new EnemyProjectile(enemy.x, enemy.y, {
+        vx: Math.cos(bAngle)*speed,
+        vy: Math.sin(bAngle)*speed,
+        damage: bulletDamage,
+        lifetime: 2.5,
+        color: '#ff3333',
+        type: 'death_orb',
+        w: 10, h: 10,
+      }));
+    }
   }
 };
 
@@ -893,7 +1251,49 @@ function update(dt) {
 
   // 敌人更新（传入敌人列表用于推开）
   enemies.forEach(function(enemy){
-    if (!enemy.dead) enemy.update(dt, player.x, player.y, enemies);
+    if (!enemy.dead) enemy.update(dt, player.x, player.y, enemies, em);
+  });
+
+  // 弓骷髅：射箭逻辑
+  enemies.forEach(function(enemy){
+    if (enemy.dead || enemy.typeName !== 'archer') return;
+    if (enemy.shootTimer <= 0) {
+      enemy.shootTimer = 2.2 + Math.random() * 0.8;
+      var dx = player.x - enemy.x, dy = player.y - enemy.y;
+      var dist = Math.sqrt(dx*dx+dy*dy);
+      if (dist > 0) {
+        var spd = 220;
+        em.add(new EnemyProjectile(enemy.x, enemy.y, {
+          vx: (dx/dist)*spd,
+          vy: (dy/dist)*spd,
+          damage: enemy.damage,
+          lifetime: 3.0,
+          color: '#ff3333',
+          type: 'arrow',
+          w: 10, h: 10,
+        }));
+      }
+    }
+  });
+
+  // 爆炸幽灵：接触玩家时引爆（范围伤害）
+  enemies.forEach(function(enemy){
+    if (enemy.dead || enemy.typeName !== 'bomber') return;
+    var dx = player.x - enemy.x, dy = player.y - enemy.y;
+    var dist = Math.sqrt(dx*dx+dy*dy);
+    if (dist < enemy.explodeRange * 0.5) {
+      // 触发爆炸
+      if (enemy.canAttack()) {
+        enemy.onAttack();
+        // 爆炸本体伤害
+        player.takeDamage(enemy.damage);
+        spawnDamageNumber(player.x, player.y-20, enemy.damage);
+        // 强制死亡（引爆）
+        enemy.dead = true;
+        Spawner.onEnemyDeath(enemy, em);
+        player.kills++;
+      }
+    }
   });
 
   // 投射物 vs 敌人
@@ -910,9 +1310,21 @@ function update(dt) {
     });
   });
 
-  // 敌人 vs 玩家（带攻击冷却）
+  // 敌方弹丸 vs 玩家
+  var enemyProjs = em.filter(EnemyProjectile);
+  enemyProjs.forEach(function(ep){
+    ep.update(dt);
+    if (!ep.dead && !ep.hasHit && ep.overlaps(player)) {
+      ep.hasHit = true;
+      ep.dead = true;
+      player.takeDamage(ep.damage);
+      spawnDamageNumber(player.x, player.y-20, ep.damage);
+    }
+  });
+
+  // 敌人 vs 玩家（带攻击冷却，bomber 除外已在上面处理）
   enemies.forEach(function(enemy){
-    if (enemy.dead) return;
+    if (enemy.dead || enemy.typeName === 'bomber') return;
     if (enemy.overlaps(player)) {
       if (enemy.canAttack()) {
         enemy.onAttack();
@@ -928,6 +1340,20 @@ function update(dt) {
     var val = gem.update(dt, player.x, player.y, player.pickupRange);
     if (val > 0) {
       if (player.addXp(val)) showLevelUpScreen();
+    }
+  });
+
+  // 回血道具拾取
+  var potions = em.filter(HealthPotion);
+  potions.forEach(function(pot){
+    var typeName = pot.update(dt, player.x, player.y, player.pickupRange + 30);
+    if (typeName) {
+      var healAmount = pot.heal;
+      if (healAmount === 0) {
+        healAmount = Math.floor(player.maxHp * 0.5);
+      }
+      player.hp = Math.min(player.maxHp, player.hp + healAmount);
+      spawnHealNumber(player.x, player.y - 20, healAmount, typeName);
     }
   });
 
@@ -1028,8 +1454,22 @@ function spawnDamageNumber(x, y, amount) {
   el.textContent = '-'+amount;
   el.style.left = (x-camera.x+Math.random()*30-15)+'px';
   el.style.top = (y-camera.y-20)+'px';
+  el.style.color = '#ff6b6b';
   $('ui-overlay').appendChild(el);
   setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 800);
+}
+
+function spawnHealNumber(x, y, amount, typeName) {
+  var el = document.createElement('div');
+  el.className = 'dmg-number';
+  var prefix = typeName === 'chicken' ? '🐔 +' : '+';
+  el.textContent = prefix + amount;
+  el.style.left = (x-camera.x+Math.random()*20-10)+'px';
+  el.style.top = (y-camera.y-20)+'px';
+  el.style.color = '#4ade80';
+  el.style.fontSize = '16px';
+  $('ui-overlay').appendChild(el);
+  setTimeout(function(){ if (el.parentNode) el.parentNode.removeChild(el); }, 1000);
 }
 
 // ============ 全局 Game 对象 ============
